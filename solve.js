@@ -22,10 +22,16 @@
 //   its record starts on (counting every LF, CRLF and lone CR inside quotes),
 //   row its record's index in rows, null for the header.
 //
-// Speed notes: the scan is driven by indexOf for ',' and '\n' (dense in CSV).
-// '\r' is only ever searched inside the short window up to the next ',' or
-// '\n' with a plain loop — an unbounded indexOf('\r') would rescan to the end
-// of the text for every field of a file that has few or no CRs.
+// Speed notes: the scan is driven by the current physical line end `le`
+// (the first LF at or after the scan point), maintained across fields, so no
+// field ever searches for '\n' again. ',', '"' and '\r' positions are tracked
+// with lazily-advanced cursors: each indexOf that moves one starts where the
+// previous one left off, so total scanning is O(n) and no field ever allocates
+// a search slice. When the rest of a line holds no quote and no stray CR, the
+// whole remainder is split at once with the comma cursor. The quoted-content
+// check reuses the closing-quote search and the `le`/cursor comparisons, so a
+// clean quoted field costs one slice. Per-record error arrays are only created
+// when a record actually has an error.
 
 const QUOTE = 34; // "
 const COMMA = 44; // ,
@@ -42,27 +48,18 @@ export function run(input) {
 
   const records = []; // array of field arrays
   const recLines = []; // start line per record
-  const recErrs = []; // per-record error objects (line/row stamped later)
-  let pending = []; // errors met before a record starts (stray CRs)
+  const recErrs = []; // per-record error objects, null when the record is clean
+  let pending = null; // errors met before a record starts (stray CRs)
   let pendingLine = 1;
 
-  // The next field delimiter at or after `from`: the nearest ',' or '\n',
-  // or a '\r' that comes before both. Returns [index, charCode] or [-1, 0]
-  // when the field runs to the end of the text. The '\r' search is a plain
-  // loop over the window [from, nearest ','/'\n') only.
-  function nextDelim(from) {
-    let m = -1;
-    let mc = 0;
-    const a = text.indexOf(',', from);
-    if (a >= 0) { m = a; mc = COMMA; }
-    const b = text.indexOf('\n', from);
-    if (b >= 0 && (m < 0 || b < m)) { m = b; mc = LF; }
-    const end = m < 0 ? n : m;
-    for (let k = from; k < end; k++) {
-      if (text.charCodeAt(k) === CR) return [k, CR];
-    }
-    return [m, mc];
-  }
+  // Lazily-advanced cursors: commaNext/qNext/cNext are the next ',' / '"' /
+  // '\r' at or after the current scan point, or -1 when none remain. Every
+  // indexOf that moves one starts where the previous one left off, so total
+  // scanning is O(n). A cursor is re-synced (one indexOf) only once the scan
+  // point has passed it.
+  let commaNext = text.indexOf(',', i);
+  let qNext = text.indexOf('"', i);
+  let cNext = text.indexOf('\r', i);
 
   while (i < n) {
     // Skip empty lines; a lone CR here is dropped with a stray_cr error that
@@ -81,7 +78,7 @@ export function run(input) {
           line++;
           skipping = true;
         } else {
-          if (pending.length === 0) pendingLine = line;
+          if (pending === null) { pending = []; pendingLine = line; }
           pending.push({ code: 'stray_cr' });
           i++;
           skipping = true;
@@ -89,24 +86,40 @@ export function run(input) {
       }
     }
     if (i >= n) break;
+    // Re-sync cursors after skipping (a consumed CR/comma may be behind i).
+    if (commaNext >= 0 && commaNext < i) commaNext = text.indexOf(',', i);
+    if (qNext >= 0 && qNext < i) qNext = text.indexOf('"', i);
+    if (cNext >= 0 && cNext < i) cNext = text.indexOf('\r', i);
 
     const startLine = line;
+    // `le` is the first LF at or after i, or n when the rest has no LF.
+    let le = text.indexOf('\n', i);
+    if (le < 0) le = n;
     const fields = [];
-    const errs = pending;
-    pending = [];
+    let errs = pending;
+    pending = null;
 
     for (;;) {
-      // ---- parse one field; leaves `term` as 'comma' | 'eol' | 'eof' ----
+      // Re-sync the line end and cursors: a quoted field may have consumed
+      // embedded newlines, and a quote/CR/comma may have been consumed.
+      if (le < i) { le = text.indexOf('\n', i); if (le < 0) le = n; }
+      if (commaNext >= 0 && commaNext < i) commaNext = text.indexOf(',', i);
+      if (cNext >= 0 && cNext < i) cNext = text.indexOf('\r', i);
+
+      // ---- parse one field; `term` is 'comma' | 'eol' | 'eof' ----
       let value;
       let term;
       if (text.charCodeAt(i) === QUOTE) {
+        // A quote-leading field can never take the fast path, so it is
+        // parsed directly (no qNext sync, no fast-path check).
         // Look ahead for the closing quote (a quote that is not doubled).
         let j = i + 1;
         let closed = -1;
+        let hasDoubled = false;
         while (j < n) {
           j = text.indexOf('"', j);
           if (j < 0) break;
-          if (text.charCodeAt(j + 1) === QUOTE) j += 2;
+          if (text.charCodeAt(j + 1) === QUOTE) { hasDoubled = true; j += 2; }
           else { closed = j; break; }
         }
         if (closed >= 0) {
@@ -114,52 +127,82 @@ export function run(input) {
           // CRLF or lone CR -> LF (counting one line break each, as does LF).
           const a = i + 1;
           const b = closed;
-          let parts = null;
-          let start = a;
-          let k = a;
-          while (k < b) {
-            // Next '"' or '\n' inside the content, whichever comes first.
-            let m = -1;
-            let kind = 0;
-            const q = text.indexOf('"', k);
-            if (q >= 0 && q < b) { m = q; kind = 1; }
-            const l = text.indexOf('\n', k);
-            if (l >= 0 && l < b && (m < 0 || l < m)) { m = l; kind = 3; }
-            const end = m < 0 ? b : m;
-            // A CR before that point is the next special character.
-            let r = -1;
-            for (let s = k; s < end; s++) {
-              if (text.charCodeAt(s) === CR) { r = s; break; }
+          // No doubled quote, no LF (le is the first LF at/after i, so an LF
+          // in the content would sit before b) and no CR (cNext is the next
+          // CR at/after i) inside: plain slice.
+          if (!hasDoubled && le >= b && (cNext < 0 || cNext >= b)) {
+            value = text.slice(a, b);
+          } else {
+            const lineBefore = line;
+            let parts = null;
+            let start = a;
+            let k = a;
+            while (k < b) {
+              // Next '"' or '\n' inside the content, whichever comes first.
+              let m = -1;
+              let kind = 0;
+              const qq = text.indexOf('"', k);
+              if (qq >= 0 && qq < b) { m = qq; kind = 1; }
+              const ll = text.indexOf('\n', k);
+              if (ll >= 0 && ll < b && (m < 0 || ll < m)) { m = ll; kind = 3; }
+              if (cNext >= 0 && cNext < k) cNext = text.indexOf('\r', k);
+              if (cNext >= 0 && cNext < b && (m < 0 || cNext < m)) {
+                if (parts === null) parts = [text.slice(a, cNext)];
+                else parts.push(text.slice(start, cNext));
+                parts.push('\n');
+                line++;
+                k = text.charCodeAt(cNext + 1) === LF ? cNext + 2 : cNext + 1;
+                start = k;
+                cNext = text.indexOf('\r', k);
+                continue;
+              }
+              if (m < 0) break;
+              if (kind === 3) {
+                line++;
+                k = m + 1;
+              } else {
+                if (parts === null) parts = [text.slice(a, m)];
+                else parts.push(text.slice(start, m));
+                parts.push('"');
+                k = m + 2;
+                start = k;
+              }
             }
-            if (r >= 0) {
-              if (parts === null) parts = [text.slice(a, r)];
-              else parts.push(text.slice(start, r));
-              parts.push('\n');
-              line++;
-              k = text.charCodeAt(r + 1) === LF ? r + 2 : r + 1;
-              start = k;
-              continue;
-            }
-            if (m < 0) break;
-            if (kind === 3) {
-              line++;
-              k = m + 1;
-            } else {
-              if (parts === null) parts = [text.slice(a, m)];
-              else parts.push(text.slice(start, m));
-              parts.push('"');
-              k = m + 2;
-              start = k;
-            }
+            value = parts === null ? text.slice(a, b) : (parts.push(text.slice(start, b)), parts.join(''));
+            // The content may have consumed line breaks: `le` is stale then.
+            if (line !== lineBefore) { le = text.indexOf('\n', closed + 1); if (le < 0) le = n; }
           }
-          value = parts === null ? text.slice(a, b) : (parts.push(text.slice(start, b)), parts.join(''));
           i = closed + 1;
           // Junk: what follows the closing quote, up to the next comma or
           // line break, is appended as it stands (a lone CR is dropped, as
           // anywhere outside quotes, with a stray_cr error).
           let appended = false;
           for (;;) {
-            const [m, mc] = nextDelim(i);
+            // Fast path: the character right after the closing quote is
+            // usually the delimiter itself — no search needed.
+            if (i >= n) { term = 'eof'; break; }
+            const ch = text.charCodeAt(i);
+            if (ch === COMMA) { i++; term = 'comma'; break; }
+            if (ch === LF) { i++; line++; term = 'eol'; break; }
+            if (ch === CR) {
+              if (text.charCodeAt(i + 1) === LF) { i += 2; line++; term = 'eol'; break; }
+              // lone CR: dropped, the junk goes on
+              if (errs === null) errs = [];
+              errs.push({ code: 'stray_cr' });
+              i++;
+              cNext = text.indexOf('\r', i);
+              continue;
+            }
+            // Junk present: nearest delimiter at/after i is the comma
+            // cursor, the LF at le, or the next CR (cNext).
+            if (commaNext >= 0 && commaNext < i) commaNext = text.indexOf(',', i);
+            let m;
+            let mc;
+            if (commaNext >= 0 && commaNext < le) { m = commaNext; mc = COMMA; }
+            else if (le < n) { m = le; mc = LF; }
+            else { m = -1; mc = 0; }
+            if (cNext >= 0 && cNext < i) cNext = text.indexOf('\r', i);
+            if (cNext >= 0 && (m < 0 ? cNext < n : cNext < m)) { m = cNext; mc = CR; }
             if (m < 0) {
               if (n > i) { value += text.slice(i, n); appended = true; }
               i = n;
@@ -169,8 +212,10 @@ export function run(input) {
             if (mc === CR && text.charCodeAt(m + 1) !== LF) {
               // lone CR inside junk: dropped, the junk goes on
               if (m > i) { value += text.slice(i, m); appended = true; }
+              if (errs === null) errs = [];
               errs.push({ code: 'stray_cr' });
               i = m + 1;
+              cNext = text.indexOf('\r', i);
               continue;
             }
             if (m > i) { value += text.slice(i, m); appended = true; }
@@ -189,14 +234,38 @@ export function run(input) {
             }
             break;
           }
-          if (appended) errs.push({ code: 'quote_junk' });
+          if (appended) {
+            if (errs === null) errs = [];
+            errs.push({ code: 'quote_junk' });
+          }
           fields.push(value);
           if (term !== 'comma') break;
           continue;
         }
         // No closing quote: the quote is a literal character and the text
         // after it is read again as unquoted.
+        if (errs === null) errs = [];
         errs.push({ code: 'unterminated_quote' });
+      } else {
+        // Unquoted field: sync the quote cursor and try the fast path —
+        // the rest of this physical line has no quote and no stray CR
+        // (a CR right before its LF is the CRLF terminator). Split it all.
+        if (qNext >= 0 && qNext < i) qNext = text.indexOf('"', i);
+        const isCRLF = le < n && cNext === le - 1;
+        if ((qNext < 0 || qNext >= le) && (cNext < 0 || cNext >= le || isCRLF)) {
+          const eol = isCRLF ? le - 1 : le;
+          if (commaNext >= 0 && commaNext < i) commaNext = text.indexOf(',', i);
+          let f = i;
+          for (;;) {
+            if (commaNext < 0 || commaNext >= eol) { fields.push(text.slice(f, eol)); break; }
+            fields.push(text.slice(f, commaNext));
+            f = commaNext + 1;
+            commaNext = text.indexOf(',', f);
+          }
+          i = le < n ? le + 1 : n;
+          line++;
+          break;
+        }
       }
       // Unquoted field (also the unterminated-quote re-read): read to the
       // next comma or line break; a lone CR is dropped with stray_cr; a
@@ -205,7 +274,14 @@ export function run(input) {
         let start = i;
         let chunks = null;
         for (;;) {
-          const [m, mc] = nextDelim(i);
+          if (commaNext >= 0 && commaNext < i) commaNext = text.indexOf(',', i);
+          let m;
+          let mc;
+          if (commaNext >= 0 && commaNext < le) { m = commaNext; mc = COMMA; }
+          else if (le < n) { m = le; mc = LF; }
+          else { m = -1; mc = 0; }
+          if (cNext >= 0 && cNext < i) cNext = text.indexOf('\r', i);
+          if (cNext >= 0 && (m < 0 ? cNext < n : cNext < m)) { m = cNext; mc = CR; }
           if (m < 0) {
             value = chunks === null ? text.slice(start, n) : (chunks.push(text.slice(start, n)), chunks.join(''));
             i = n;
@@ -216,9 +292,11 @@ export function run(input) {
             // lone CR: dropped, the field goes on
             if (chunks === null) chunks = [text.slice(start, m)];
             else chunks.push(text.slice(start, m));
+            if (errs === null) errs = [];
             errs.push({ code: 'stray_cr' });
             i = m + 1;
             start = i;
+            cNext = text.indexOf('\r', i);
             continue;
           }
           value = chunks === null ? text.slice(start, m) : (chunks.push(text.slice(start, m)), chunks.join(''));
@@ -261,23 +339,29 @@ export function run(input) {
       if (!isHeader) {
         rowIdx = rows.length;
         if (rec.length < width) {
-          recErrs[r].push({ code: 'short_row', fields: rec.length });
+          let e = recErrs[r];
+          if (e === null) e = recErrs[r] = [];
+          e.push({ code: 'short_row', fields: rec.length });
           while (rec.length < width) rec.push('');
         } else if (rec.length > width) {
           const extra = rec.splice(width);
-          recErrs[r].push({ code: 'long_row', extra });
+          let e = recErrs[r];
+          if (e === null) e = recErrs[r] = [];
+          e.push({ code: 'long_row', extra });
         }
         rows.push(rec);
       }
       const errs = recErrs[r];
-      for (let e = 0; e < errs.length; e++) {
-        errs[e].line = recLines[r];
-        errs[e].row = rowIdx;
-        errors.push(errs[e]);
+      if (errs !== null) {
+        for (let e = 0; e < errs.length; e++) {
+          errs[e].line = recLines[r];
+          errs[e].row = rowIdx;
+          errors.push(errs[e]);
+        }
       }
     }
   }
-  if (pending.length > 0) {
+  if (pending !== null) {
     // Stray CRs met after the last record: they belong to no record.
     const rowIdx = records.length === 0 ? (header ? null : 0) : rows.length;
     for (const e of pending) {
